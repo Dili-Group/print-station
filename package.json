@@ -3,6 +3,9 @@
   "version": "2.0.0",
   "description": "Fastify HTTP agent: nhan lenh in van don qua Cloudflare Tunnel + Access, in ra may in nhiet",
   "main": "server.js",
+  "bin": {
+    "print-station-setup": "./setup.js"
+  },
   "scripts": {
     "start": "node server.js",
     "print-once": "node print-once.js"
