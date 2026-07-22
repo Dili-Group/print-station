@@ -17,7 +17,7 @@ const CHROME_PATH =
 const SUMATRA_PATH =
   process.env.SUMATRA_PATH ||
   path.join(process.env.LOCALAPPDATA || "", "SumatraPDF", "SumatraPDF.exe");
-const DEFAULT_PRINTER = process.env.PRINTER_NAME || "SP46 (Copy 1)";
+const DEFAULT_PRINTER = process.env.PRINTER_NAME || "SP46";
 // Giới hạn host được phép in (phẩy ngăn cách). Bỏ trống = cho phép mọi host.
 const ALLOWED_HOSTS = (process.env.ALLOWED_HOSTS || "")
   .split(",")
