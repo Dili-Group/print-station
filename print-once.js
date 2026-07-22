@@ -3,7 +3,7 @@
 //   node print-once.js "<link>" [tracking_number] --force  -> in lai du da in
 //   node print-once.js "<link>" --dry                      -> chi xuat PDF kiem tra, khong in
 require("dotenv").config();
-const { printLabel } = require("./printer");
+const { printLabel, closeBrowser } = require("./printer");
 const { logPrint } = require("./logger");
 const { getPrinted, markPrinted } = require("./store");
 const { notifyPrintError } = require("./notify");
@@ -43,8 +43,11 @@ if (!url) {
     pages: r.pages,
     type: r.type,
   });
-})().catch(async (e) => {
-  logPrint({ status: "FAIL", jobId: "manual", tracking, url, error: e.message });
-  await notifyPrintError({ tracking, jobId: "manual", error: e.message });
-  process.exitCode = 1; // không dùng process.exit() - tránh crash libuv khi Chrome đang đóng
-});
+})()
+  .catch(async (e) => {
+    logPrint({ status: "FAIL", jobId: "manual", tracking, url, error: e.message });
+    await notifyPrintError({ tracking, jobId: "manual", error: e.message });
+    process.exitCode = 1; // không dùng process.exit() - tránh crash libuv khi Chrome đang đóng
+  })
+  // Chrome giờ sống dai trong printer.js - phải đóng thì process 1-lần mới thoát
+  .finally(() => closeBrowser());

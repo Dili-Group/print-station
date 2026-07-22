@@ -68,13 +68,11 @@ const PRINT_VERIFY_TIMEOUT_MS = Number(process.env.PRINT_VERIFY_TIMEOUT_MS || 15
 const SUMATRA_TIMEOUT_MS = Number(process.env.SUMATRA_TIMEOUT_MS || 30000);
 const PS_TIMEOUT_MS = Number(process.env.PS_TIMEOUT_MS || 10000);
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function psRun(cmd) {
+async function psRun(cmd, timeoutMs = PS_TIMEOUT_MS) {
   const { stdout } = await execFileAsync(
     "powershell.exe",
     ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", cmd],
-    { windowsHide: true, timeout: PS_TIMEOUT_MS, killSignal: "SIGKILL" }
+    { windowsHide: true, timeout: timeoutMs, killSignal: "SIGKILL" }
   );
   return stdout.trim();
 }
@@ -118,24 +116,37 @@ async function printPdfFile(pdfPath, printer, step = () => {}) {
   }
   step("sumatra", sumatraKilled ? `TREO qua ${SUMATRA_TIMEOUT_MS}ms, da kill` : "exit binh thuong");
 
-  // Chờ ngắn cho job kịp xuất hiện trong queue rồi poll nhanh — response trả về
-  // ngay khi job thoát queue thay vì đợi trọn nhịp 1s như trước
-  await sleep(300);
-  const deadline = Date.now() + PRINT_VERIFY_TIMEOUT_MS;
-  let stuck = [];
-  let polls = 0;
-  while (true) {
-    const ids = await getQueueJobIds(printer);
-    polls++;
-    stuck = ids.filter((id) => !before.has(id));
-    if (stuck.length === 0) {
-      step("verify_queue", `queue sach sau ${polls} lan poll`);
-      return; // job của mình đã thoát queue -> đã in
-    }
-    if (Date.now() >= deadline) break;
-    await sleep(500);
+  // Verify bằng MỘT process PowerShell tự poll bên trong (250ms/nhịp):
+  // spawn PowerShell mất ~0.5-1s nên spawn mỗi vòng poll như trước tốn 2-4s/đơn.
+  // Script in "CLEAN <polls>" khi queue sạch, "STUCK <polls> <ids>" khi quá hạn.
+  const esc = printer.replace(/'/g, "''");
+  const beforeList = [...before].join(",");
+  const verifyScript =
+    `$before = @(${beforeList}); ` +
+    `$deadline = (Get-Date).AddMilliseconds(${PRINT_VERIFY_TIMEOUT_MS}); ` +
+    `$polls = 0; ` +
+    `while ($true) { ` +
+    `$ids = @(Get-PrintJob -PrinterName '${esc}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id); ` +
+    `$polls++; ` +
+    `$stuck = @($ids | Where-Object { $before -notcontains $_ }); ` +
+    `if ($stuck.Count -eq 0) { Write-Output ('CLEAN ' + $polls); exit 0 } ` +
+    `if ((Get-Date) -ge $deadline) { Write-Output ('STUCK ' + $polls + ' ' + ($stuck -join ',')); exit 0 } ` +
+    `Start-Sleep -Milliseconds 250 }`;
+
+  let out = "";
+  try {
+    out = await psRun(verifyScript, PRINT_VERIFY_TIMEOUT_MS + PS_TIMEOUT_MS);
+  } catch (err) {
+    throw new Error(`Khong verify duoc queue may in "${printer}": ${err.message}`);
   }
 
+  if (out.startsWith("CLEAN")) {
+    step("verify_queue", `queue sach sau ${out.split(" ")[1]} lan poll`);
+    return; // job của mình đã thoát queue -> đã in
+  }
+
+  const [, polls, idList] = out.split(" ");
+  const stuck = (idList || "").split(",").map(Number).filter(Number.isFinite);
   step("verify_queue", `KET ${stuck.length} job sau ${polls} lan poll -> huy`);
   for (const id of stuck) await cancelJob(printer, id);
   throw new Error(
@@ -167,20 +178,47 @@ async function tryFetchDirectPdf(u) {
   return p;
 }
 
-// Render HTML bằng Chrome, xuất PDF đúng khổ nội dung.
-async function renderHtmlToPdf(u, opts, step = () => {}) {
-  const browser = await puppeteer.launch({
+// Chrome sống dai giữa các job: launch lạnh mất ~1.5-3s/đơn nên chỉ launch 1 lần,
+// job sau tái dùng. Chrome crash/bị kill -> connected=false -> tự launch lại.
+let browserPromise = null;
+async function getBrowser() {
+  if (browserPromise) {
+    try {
+      const b = await browserPromise;
+      if (b.connected) return b;
+    } catch {
+      // launch trước đó fail -> thử lại bên dưới
+    }
+    browserPromise = null;
+  }
+  browserPromise = puppeteer.launch({
     executablePath: CHROME_PATH,
     headless: true,
     args: ["--no-sandbox", "--disable-gpu"],
   });
-  step("chrome_launch");
   try {
-    const page = await browser.newPage();
-    await page.goto(u.href, { waitUntil: "networkidle0", timeout: 60000 });
-    step("page_goto", "networkidle0");
+    return await browserPromise;
+  } catch (err) {
+    browserPromise = null;
+    throw err;
+  }
+}
 
+// Render HTML bằng Chrome, xuất PDF đúng khổ nội dung.
+async function renderHtmlToPdf(u, opts, step = () => {}) {
+  const browser = await getBrowser();
+  step("chrome_ready");
+  const page = await browser.newPage();
+  try {
     const isVtp = u.hostname.toLowerCase().endsWith("viettelpost.vn");
+    // VTP: chỉ cần DOM + script chạy, phần barcode đã có waitForFunction riêng lo.
+    // Host lạ: networkidle2 (nhanh hơn networkidle0, không kẹt vì analytics/polling).
+    await page.goto(u.href, {
+      waitUntil: isVtp ? "domcontentloaded" : "networkidle2",
+      timeout: 60000,
+    });
+    step("page_goto", isVtp ? "domcontentloaded" : "networkidle2");
+
     if (isVtp) {
       // Viettel Post: chờ QR + barcode vẽ xong bằng JS
       await page.waitForFunction(
@@ -197,9 +235,11 @@ async function renderHtmlToPdf(u, opts, step = () => {}) {
       );
       step("vtp_wait_barcode");
     }
-    // Đệm chờ render (font, ảnh, JS khác) - tăng qua job data { delayMs }
-    await new Promise((r) => setTimeout(r, opts.delayMs ?? 1500));
-    step("render_delay", `delayMs=${opts.delayMs ?? 1500}`);
+    // Đệm chờ render (font, ảnh, JS khác) - tăng qua job data { delayMs }.
+    // VTP đã chờ barcode/QR xong ở trên nên chỉ cần đệm ngắn.
+    const delayMs = opts.delayMs ?? (isVtp ? 300 : 1500);
+    await new Promise((r) => setTimeout(r, delayMs));
+    step("render_delay", `delayMs=${delayMs}`);
 
     // Chọn vùng cần in: job chỉ định selector > khối tem tự nhận diện > body.
     // .mainPrints = Viettel Post, .label-a6 = digitalize.dilisupplement.com
@@ -265,8 +305,9 @@ async function renderHtmlToPdf(u, opts, step = () => {}) {
     step("pdf_export", `${info.count} trang, ${widthMm}x${heightMm}mm`);
     return { pdfPath, pages: info.count, widthMm, heightMm };
   } finally {
-    await browser.close().catch(() => {});
-    step("chrome_close");
+    // Chỉ đóng page, giữ browser sống cho job sau
+    await page.close().catch(() => {});
+    step("page_close");
   }
 }
 
@@ -276,14 +317,31 @@ async function renderHtmlToPdf(u, opts, step = () => {}) {
  * @param {object} opts { selector, delayMs, printer, skipPrint }
  * @returns {Promise<{type: "pdf"|"html", pages: number|null, pdfPath?: string}>}
  */
+// Host chắc chắn trả HTML (không bao giờ là PDF trực tiếp) -> khỏi probe, đỡ 0.5-1s
+const KNOWN_HTML_HOST_SUFFIXES = ["viettelpost.vn", "digitalize.dilisupplement.com"];
+function isKnownHtmlHost(u) {
+  const h = u.hostname.toLowerCase();
+  return (
+    !u.pathname.toLowerCase().endsWith(".pdf") &&
+    KNOWN_HTML_HOST_SUFFIXES.some((s) => h === s || h.endsWith("." + s))
+  );
+}
+
 async function printLabel(url, opts = {}) {
   const u = validateUrl(url);
   const printer = opts.printer || DEFAULT_PRINTER;
   const step = makeStep(opts.tag);
 
-  // 1) PDF trực tiếp?
-  const directPdf = await tryFetchDirectPdf(u);
-  step("fetch_direct_pdf", directPdf ? "la PDF truc tiep" : "khong phai PDF -> render Chrome");
+  // 1) PDF trực tiếp? Host đã biết là HTML thì bỏ probe; host lạ thì probe
+  //    song song với việc dựng sẵn Chrome (đằng nào cũng cần 1 trong 2)
+  let directPdf = null;
+  if (isKnownHtmlHost(u)) {
+    step("fetch_direct_pdf", "host HTML da biet -> bo probe");
+  } else {
+    getBrowser().catch(() => {}); // warm Chrome song song; lỗi thật sẽ nổi ở renderHtmlToPdf
+    directPdf = await tryFetchDirectPdf(u);
+    step("fetch_direct_pdf", directPdf ? "la PDF truc tiep" : "khong phai PDF -> render Chrome");
+  }
   if (directPdf) {
     if (opts.skipPrint) return { type: "pdf", pages: null, pdfPath: directPdf };
     await printPdfFile(directPdf, printer, step);
@@ -299,4 +357,17 @@ async function printLabel(url, opts = {}) {
   return { type: "html", pages: r.pages };
 }
 
-module.exports = { printLabel };
+// Đóng Chrome sống dai - cần cho script chạy 1 lần (print-once) để process thoát được
+async function closeBrowser() {
+  if (!browserPromise) return;
+  const p = browserPromise;
+  browserPromise = null;
+  try {
+    const b = await p;
+    await b.close();
+  } catch {
+    // Chrome đã chết sẵn thì thôi
+  }
+}
+
+module.exports = { printLabel, closeBrowser };
