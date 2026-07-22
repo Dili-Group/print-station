@@ -65,7 +65,7 @@ console.log(`
 Cai dat xong: ${DEST}
 
 Buoc tiep theo:
-  1. Sua file .env (CF_ACCESS_AUD, PRINTER_NAME, duong dan Chrome/Sumatra...)
+  1. Sua file .env (PRINTER_NAME, duong dan Chrome/Sumatra...)
   2. cd ${targetName}
   3. pm2 start ecosystem.config.cjs
   4. pm2 save        (giu process sau khi reboot, kem pm2 startup neu can)

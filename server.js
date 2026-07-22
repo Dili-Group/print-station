@@ -12,7 +12,6 @@
 // }
 require("dotenv").config();
 const fastify = require("fastify");
-const { createRemoteJWKSet, jwtVerify } = require("jose");
 const { printLabel } = require("./printer");
 const { logPrint, LOG_DIR } = require("./logger");
 const { getPrinted, markPrinted, DB_PATH } = require("./store");
@@ -20,16 +19,6 @@ const { notifyPrintError } = require("./notify");
 
 const PORT = Number(process.env.PORT || 9100);
 const STATION = process.env.STATION || "kho-bd";
-const TEAM_DOMAIN = process.env.CF_TEAM_DOMAIN;
-const AUD = process.env.CF_ACCESS_AUD;
-
-if (!TEAM_DOMAIN || !AUD) {
-  console.error("Thieu CF_TEAM_DOMAIN hoac CF_ACCESS_AUD trong .env - khong the verify Access JWT, thoat.");
-  process.exit(1);
-}
-
-// JWKS cua Cloudflare Access - jose tu cache va refresh key
-const JWKS = createRemoteJWKSet(new URL(`https://${TEAM_DOMAIN}/cdn-cgi/access/certs`));
 
 // In tuan tu: thay concurrency:1 cua BullMQ bang promise chain mutex.
 // Moi loi goi printLabel phai di qua serialize() de tranh chen tem.
@@ -48,25 +37,8 @@ const app = fastify({
   requestTimeout: 0,
 });
 
-// Verify Cloudflare Access JWT cho moi request, tru /health.
-// LUU Y: khong bao gio log gia tri token ra file log.
-app.addHook("preHandler", async (req, reply) => {
-  const path = req.url.split("?")[0];
-  if (path === "/health") return;
-
-  const token = req.headers["cf-access-jwt-assertion"];
-  if (!token) {
-    return reply.code(401).send({ error: "Thieu header cf-access-jwt-assertion" });
-  }
-  try {
-    await jwtVerify(token, JWKS, {
-      issuer: `https://${TEAM_DOMAIN}`,
-      audience: AUD,
-    });
-  } catch (err) {
-    return reply.code(401).send({ error: "Access JWT khong hop le" });
-  }
-});
+// Khong verify Access JWT trong app: auth chan het o edge (Cloudflare Access)
+// + cloudflared validate JWT truoc khi proxy. Server chi bind 127.0.0.1.
 
 app.get("/health", async () => ({
   ok: true,
