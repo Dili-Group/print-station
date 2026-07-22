@@ -51,6 +51,10 @@ function validateUrl(url) {
 
 // Sau khi gửi lệnh in bao lâu mà job vẫn kẹt trong queue thì coi là máy in lỗi/hết giấy
 const PRINT_VERIFY_TIMEOUT_MS = Number(process.env.PRINT_VERIFY_TIMEOUT_MS || 15000);
+// SumatraPDF -silent đôi khi in xong nhưng process không thoát (kẹt handle spooler)
+// -> quá hạn thì kill; tem đã ra hay chưa sẽ do vòng verify queue quyết định
+const SUMATRA_TIMEOUT_MS = Number(process.env.SUMATRA_TIMEOUT_MS || 30000);
+const PS_TIMEOUT_MS = Number(process.env.PS_TIMEOUT_MS || 10000);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -58,7 +62,7 @@ async function psRun(cmd) {
   const { stdout } = await execFileAsync(
     "powershell.exe",
     ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", cmd],
-    { windowsHide: true }
+    { windowsHide: true, timeout: PS_TIMEOUT_MS, killSignal: "SIGKILL" }
   );
   return stdout.trim();
 }
@@ -85,20 +89,30 @@ async function cancelJob(printer, id) {
 async function printPdfFile(pdfPath, printer) {
   const before = new Set(await getQueueJobIds(printer));
 
-  await execFileAsync(SUMATRA_PATH, [
-    "-print-to", printer,
-    "-print-settings", "fit",
-    "-silent",
-    pdfPath,
-  ], { windowsHide: true });
+  try {
+    await execFileAsync(SUMATRA_PATH, [
+      "-print-to", printer,
+      "-print-settings", "fit",
+      "-silent",
+      pdfPath,
+    ], { windowsHide: true, timeout: SUMATRA_TIMEOUT_MS, killSignal: "SIGKILL" });
+  } catch (err) {
+    // Bị kill vì quá SUMATRA_TIMEOUT_MS: job thường đã spool xong từ lâu,
+    // để vòng verify bên dưới phán xử. Lỗi khác (file hỏng, sai máy in) thì ném luôn.
+    if (!err.killed) throw err;
+  }
 
+  // Chờ ngắn cho job kịp xuất hiện trong queue rồi poll nhanh — response trả về
+  // ngay khi job thoát queue thay vì đợi trọn nhịp 1s như trước
+  await sleep(300);
   const deadline = Date.now() + PRINT_VERIFY_TIMEOUT_MS;
   let stuck = [];
-  while (Date.now() < deadline) {
-    await sleep(1000);
+  while (true) {
     const ids = await getQueueJobIds(printer);
     stuck = ids.filter((id) => !before.has(id));
     if (stuck.length === 0) return; // job của mình đã thoát queue -> đã in
+    if (Date.now() >= deadline) break;
+    await sleep(500);
   }
 
   for (const id of stuck) await cancelJob(printer, id);
