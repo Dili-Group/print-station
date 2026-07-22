@@ -10,6 +10,18 @@ const fs = require("fs");
 const os = require("os");
 
 const execFileAsync = promisify(execFile);
+const { logStep } = require("./logger");
+
+// Đồng hồ đo từng bước: mỗi lần gọi step("ten_buoc") ghi 1 dòng STEP với ms
+// trôi qua kể từ bước trước. tag = tracking/job id để lọc log theo đơn.
+function makeStep(tag) {
+  let last = Date.now();
+  return (step, note) => {
+    const now = Date.now();
+    logStep({ tag, step, ms: now - last, note });
+    last = now;
+  };
+}
 
 const CHROME_PATH =
   process.env.CHROME_PATH ||
@@ -86,9 +98,11 @@ async function cancelJob(printer, id) {
 // (DetectedErrorState luôn 0), nhưng khi hết giấy/tắt máy thì job kẹt lại trong queue.
 // Máy khỏe: queue rỗng sau 1-2s. Job kẹt quá PRINT_VERIFY_TIMEOUT_MS -> hủy job + báo lỗi
 // (không hủy thì lúc lắp giấy lại job cũ tự nhả ra, gây in trùng với lần retry).
-async function printPdfFile(pdfPath, printer) {
+async function printPdfFile(pdfPath, printer, step = () => {}) {
   const before = new Set(await getQueueJobIds(printer));
+  step("queue_snapshot", `queue co san ${before.size} job`);
 
+  let sumatraKilled = false;
   try {
     await execFileAsync(SUMATRA_PATH, [
       "-print-to", printer,
@@ -100,21 +114,29 @@ async function printPdfFile(pdfPath, printer) {
     // Bị kill vì quá SUMATRA_TIMEOUT_MS: job thường đã spool xong từ lâu,
     // để vòng verify bên dưới phán xử. Lỗi khác (file hỏng, sai máy in) thì ném luôn.
     if (!err.killed) throw err;
+    sumatraKilled = true;
   }
+  step("sumatra", sumatraKilled ? `TREO qua ${SUMATRA_TIMEOUT_MS}ms, da kill` : "exit binh thuong");
 
   // Chờ ngắn cho job kịp xuất hiện trong queue rồi poll nhanh — response trả về
   // ngay khi job thoát queue thay vì đợi trọn nhịp 1s như trước
   await sleep(300);
   const deadline = Date.now() + PRINT_VERIFY_TIMEOUT_MS;
   let stuck = [];
+  let polls = 0;
   while (true) {
     const ids = await getQueueJobIds(printer);
+    polls++;
     stuck = ids.filter((id) => !before.has(id));
-    if (stuck.length === 0) return; // job của mình đã thoát queue -> đã in
+    if (stuck.length === 0) {
+      step("verify_queue", `queue sach sau ${polls} lan poll`);
+      return; // job của mình đã thoát queue -> đã in
+    }
     if (Date.now() >= deadline) break;
     await sleep(500);
   }
 
+  step("verify_queue", `KET ${stuck.length} job sau ${polls} lan poll -> huy`);
   for (const id of stuck) await cancelJob(printer, id);
   throw new Error(
     `May in "${printer}" khong nha tem sau ${PRINT_VERIFY_TIMEOUT_MS / 1000}s ` +
@@ -146,15 +168,17 @@ async function tryFetchDirectPdf(u) {
 }
 
 // Render HTML bằng Chrome, xuất PDF đúng khổ nội dung.
-async function renderHtmlToPdf(u, opts) {
+async function renderHtmlToPdf(u, opts, step = () => {}) {
   const browser = await puppeteer.launch({
     executablePath: CHROME_PATH,
     headless: true,
     args: ["--no-sandbox", "--disable-gpu"],
   });
+  step("chrome_launch");
   try {
     const page = await browser.newPage();
     await page.goto(u.href, { waitUntil: "networkidle0", timeout: 60000 });
+    step("page_goto", "networkidle0");
 
     const isVtp = u.hostname.toLowerCase().endsWith("viettelpost.vn");
     if (isVtp) {
@@ -171,9 +195,11 @@ async function renderHtmlToPdf(u, opts) {
         },
         { timeout: 20000 }
       );
+      step("vtp_wait_barcode");
     }
     // Đệm chờ render (font, ảnh, JS khác) - tăng qua job data { delayMs }
     await new Promise((r) => setTimeout(r, opts.delayMs ?? 1500));
+    step("render_delay", `delayMs=${opts.delayMs ?? 1500}`);
 
     // Chọn vùng cần in: job chỉ định selector > khối tem tự nhận diện > body.
     // .mainPrints = Viettel Post, .label-a6 = digitalize.dilisupplement.com
@@ -236,9 +262,11 @@ async function renderHtmlToPdf(u, opts) {
       printBackground: true,
       pageRanges: `1-${info.count}`,
     });
+    step("pdf_export", `${info.count} trang, ${widthMm}x${heightMm}mm`);
     return { pdfPath, pages: info.count, widthMm, heightMm };
   } finally {
     await browser.close().catch(() => {});
+    step("chrome_close");
   }
 }
 
@@ -251,20 +279,22 @@ async function renderHtmlToPdf(u, opts) {
 async function printLabel(url, opts = {}) {
   const u = validateUrl(url);
   const printer = opts.printer || DEFAULT_PRINTER;
+  const step = makeStep(opts.tag);
 
   // 1) PDF trực tiếp?
   const directPdf = await tryFetchDirectPdf(u);
+  step("fetch_direct_pdf", directPdf ? "la PDF truc tiep" : "khong phai PDF -> render Chrome");
   if (directPdf) {
     if (opts.skipPrint) return { type: "pdf", pages: null, pdfPath: directPdf };
-    await printPdfFile(directPdf, printer);
+    await printPdfFile(directPdf, printer, step);
     fs.unlink(directPdf, () => {});
     return { type: "pdf", pages: null };
   }
 
   // 2/3) Render HTML (VTP hoặc generic)
-  const r = await renderHtmlToPdf(u, opts);
+  const r = await renderHtmlToPdf(u, opts, step);
   if (opts.skipPrint) return { type: "html", pages: r.pages, pdfPath: r.pdfPath };
-  await printPdfFile(r.pdfPath, printer);
+  await printPdfFile(r.pdfPath, printer, step);
   fs.unlink(r.pdfPath, () => {});
   return { type: "html", pages: r.pages };
 }

@@ -13,7 +13,7 @@
 require("dotenv").config();
 const fastify = require("fastify");
 const { printLabel } = require("./printer");
-const { logPrint, LOG_DIR } = require("./logger");
+const { logPrint, logStep, LOG_DIR } = require("./logger");
 const { getPrinted, markPrinted, DB_PATH } = require("./store");
 const { notifyPrintError } = require("./notify");
 
@@ -57,12 +57,17 @@ app.post("/print", async (req, reply) => {
   // Chong in trung: key = tracking_number, khong co thi dung url
   const key = tracking_number || url;
 
+  const tag = tracking_number || job_id || url.slice(-30);
+  const t0 = Date.now();
+  logStep({ tag, step: "nhan_request", ms: 0, note: `dang xep hang truoc do: ${pending}` });
+
   pending++;
   try {
     // Toan bo check-dedup + in + markPrinted nam trong serialize() de giu dung
     // semantics concurrency:1 cua worker cu: hai request trung key den cung luc
     // se duoc xu ly lan luot, request sau thay record da in va SKIP.
     return await serialize(async () => {
+      logStep({ tag, step: "cho_mutex", ms: Date.now() - t0 });
       const existing = getPrinted(key);
       if (existing && !force) {
         logPrint({
@@ -75,12 +80,13 @@ app.post("/print", async (req, reply) => {
         return { skipped: true, printed_at: existing.printed_at, tracking_number };
       }
 
-      const result = await printLabel(url, { selector, delayMs, printer });
+      const result = await printLabel(url, { selector, delayMs, printer, tag });
 
       // Cloudflare Queues la at-least-once: job co the duoc gui lai du tem da in.
       // markPrinted PHAI hoan tat truoc khi response tra ve - dedup qua store.js
       // la lop chan cuoi cung.
       markPrinted({ key, url, jobId: job_id, pages: result.pages, type: result.type });
+      logStep({ tag, step: "tong_cong", ms: Date.now() - t0, note: "tra response" });
 
       logPrint({
         status: existing ? "REPRINT" : "OK",
@@ -93,6 +99,7 @@ app.post("/print", async (req, reply) => {
       return { ...result, tracking_number, reprint: !!existing };
     });
   } catch (err) {
+    logStep({ tag, step: "tong_cong", ms: Date.now() - t0, note: `FAIL: ${err.message}` });
     logPrint({
       status: "FAIL",
       jobId: job_id,

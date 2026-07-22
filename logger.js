@@ -40,4 +40,30 @@ function logPrint(e) {
   process.stdout.write(line);
 }
 
-module.exports = { logPrint, LOG_DIR };
+/**
+ * Ghi 1 dòng log chi tiết từng bước in (đo nghẽn). Tắt bằng STEP_LOG=0 trong .env.
+ * @param {object} e { tag, step, ms, note }
+ */
+function logStep(e) {
+  if (process.env.STEP_LOG === "0") return;
+  const { date, time } = ts();
+  const parts = [
+    `${date} ${time}`,
+    "STEP",
+    `tag=${e.tag ?? "-"}`,
+    `step=${e.step}`,
+    `ms=${e.ms}`,
+  ];
+  if (e.note) parts.push(String(e.note).replace(/\r?\n/g, " "));
+  const line = parts.join(" | ") + "\n";
+
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(path.join(LOG_DIR, `${date}.log`), line, "utf8");
+  } catch (err) {
+    console.error("Khong ghi duoc log file:", err.message);
+  }
+  process.stdout.write(line);
+}
+
+module.exports = { logPrint, logStep, LOG_DIR };
