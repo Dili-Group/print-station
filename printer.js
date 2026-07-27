@@ -36,6 +36,9 @@ const ALLOWED_HOSTS = (process.env.ALLOWED_HOSTS || "")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
+const MERGED_HOST = "digitalize-merge.dilisupplement.com";
+
+
 const PX_PER_MM = 96 / 25.4;
 
 function tmpPdfPath() {
@@ -210,7 +213,7 @@ async function renderHtmlToPdf(u, opts, step = () => {}) {
   step("chrome_ready");
   const page = await browser.newPage();
   try {
-    const isVtp = u.hostname.toLowerCase().endsWith("viettelpost.vn");
+    const isVtp = u.hostname.toLowerCase().endsWith("viettelpost.vn") || u.hostname.toLowerCase() === MERGED_HOST;
     // VTP: chỉ cần DOM + script chạy, phần barcode đã có waitForFunction riêng lo.
     // Host lạ: networkidle2 (nhanh hơn networkidle0, không kẹt vì analytics/polling).
     await page.goto(u.href, {
@@ -318,7 +321,7 @@ async function renderHtmlToPdf(u, opts, step = () => {}) {
  * @returns {Promise<{type: "pdf"|"html", pages: number|null, pdfPath?: string}>}
  */
 // Host chắc chắn trả HTML (không bao giờ là PDF trực tiếp) -> khỏi probe, đỡ 0.5-1s
-const KNOWN_HTML_HOST_SUFFIXES = ["viettelpost.vn", "digitalize.dilisupplement.com"];
+const KNOWN_HTML_HOST_SUFFIXES = ["viettelpost.vn", "digitalize.dilisupplement.com", "digitalize-merge.dilisupplement.com"];
 function isKnownHtmlHost(u) {
   const h = u.hostname.toLowerCase();
   return (
