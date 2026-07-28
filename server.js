@@ -70,17 +70,48 @@ app.post("/print", async (req, reply) => {
       logStep({ tag, step: "cho_mutex", ms: Date.now() - t0 });
       const existing = getPrinted(key);
       if (existing && !force) {
+        const partialNote =
+          existing.type === "partial"
+            ? ` LUU Y: lan truoc IN DO ${existing.pages} tem roi may in dung - ` +
+              `dem tem thuc te va in bu bang force:true.`
+            : "";
         logPrint({
           status: "SKIP",
           jobId: job_id,
           tracking: tracking_number,
           url,
-          error: `da in luc ${existing.printed_at} (job ${existing.job_id}). Gui lai voi force:true neu can in lai`,
+          error:
+            `da in luc ${existing.printed_at} (job ${existing.job_id}). ` +
+            `Gui lai voi force:true neu can in lai.${partialNote}`,
         });
-        return { skipped: true, printed_at: existing.printed_at, tracking_number };
+        return {
+          skipped: true,
+          printed_at: existing.printed_at,
+          partial: existing.type === "partial",
+          tracking_number,
+        };
       }
 
-      const result = await printLabel(url, { selector, delayMs, printer, tag });
+      let result;
+      try {
+        result = await printLabel(url, { selector, delayMs, printer, tag });
+      } catch (err) {
+        // Máy in đã nhả được một phần tem rồi mới kẹt. Cloudflare Queue la at-least-once
+        // va con retry 5 lan -> lan retry se in LAI CA LO (hong 5x so tem). Ghi nhan
+        // ngay trong mutex de retry roi vao nhanh SKIP; phan tem thieu do nguoi van hanh
+        // dem roi in bu bang force:true.
+        if (Number(err.pagesPrinted) > 0) {
+          markPrinted({
+            key,
+            url,
+            jobId: job_id,
+            pages: err.pagesPrinted,
+            type: "partial",
+          });
+          err.markedPartial = true;
+        }
+        throw err;
+      }
 
       // Cloudflare Queues la at-least-once: job co the duoc gui lai du tem da in.
       // markPrinted PHAI hoan tat truoc khi response tra ve - dedup qua store.js
@@ -99,23 +130,28 @@ app.post("/print", async (req, reply) => {
       return { ...result, tracking_number, reprint: !!existing };
     });
   } catch (err) {
-    logStep({ tag, step: "tong_cong", ms: Date.now() - t0, note: `FAIL: ${err.message}` });
+    const detail = err.markedPartial
+      ? `${err.message} Da ghi nhan IN DO vao DB de retry khong in lai ca lo.`
+      : err.message;
+    logStep({ tag, step: "tong_cong", ms: Date.now() - t0, note: `FAIL: ${detail}` });
     logPrint({
-      status: "FAIL",
+      status: err.markedPartial ? "PARTIAL" : "FAIL",
       jobId: job_id,
       tracking: tracking_number,
       url,
-      error: err.message,
+      pages: err.markedPartial ? err.pagesPrinted : undefined,
+      error: detail,
     });
     // final: false - Cloudflare Worker con retry 5 lan, canh bao cuoi cung
     // da chuyen sang DLQ consumer. De true se spam nhom Zalo.
     notifyPrintError({
       tracking: tracking_number,
       jobId: job_id,
-      error: err.message,
-      final: false,
+      error: detail,
+      // In dở là sự cố cần người xử lý ngay và retry sẽ SKIP -> báo dứt điểm 1 lần
+      final: !!err.markedPartial,
     });
-    return reply.code(500).send({ error: err.message });
+    return reply.code(500).send({ error: detail, partial: !!err.markedPartial });
   } finally {
     pending--;
   }
