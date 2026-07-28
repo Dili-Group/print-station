@@ -64,12 +64,27 @@ function validateUrl(url) {
   return u;
 }
 
-// Sau khi gửi lệnh in bao lâu mà job vẫn kẹt trong queue thì coi là máy in lỗi/hết giấy
-const PRINT_VERIFY_TIMEOUT_MS = Number(process.env.PRINT_VERIFY_TIMEOUT_MS || 15000);
+// Ngân sách chờ queue rỗng phải TỈ LỆ VỚI SỐ TEM: máy nhả tem tuần tự ~1.2s/tem nên
+// lô 18 tem cần ~22s. Timeout cứng 15s (bản cũ) kết luận sai mọi lô >=14 tem là "kẹt giấy"
+// -> hủy job -> server trả FAIL -> Cloudflare Queue retry -> IN LẠI CẢ LÔ, lặp 4-6 lần.
+const PRINT_VERIFY_BASE_MS = Number(process.env.PRINT_VERIFY_BASE_MS || 8000);
+const PRINT_VERIFY_PER_PAGE_MS = Number(process.env.PRINT_VERIFY_PER_PAGE_MS || 1800);
+// PDF tải trực tiếp thì không đếm được số trang -> giả định lô cỡ này khi tính ngân sách
+const PRINT_VERIFY_UNKNOWN_PAGES = Number(process.env.PRINT_VERIFY_UNKNOWN_PAGES || 20);
+// Queue đứng yên (số job + PagesPrinted không nhúc nhích) quá lâu = kẹt thật.
+// Chỉ có hiệu lực SAU khi đã hết ngân sách trên, phòng driver không cập nhật PagesPrinted.
+const PRINT_STALL_TIMEOUT_MS = Number(process.env.PRINT_STALL_TIMEOUT_MS || 15000);
+// Trần tuyệt đối, chặn trường hợp driver báo tiến độ liên tục mà tem không ra
+const PRINT_VERIFY_MAX_MS = Number(process.env.PRINT_VERIFY_MAX_MS || 180000);
 // SumatraPDF -silent đôi khi in xong nhưng process không thoát (kẹt handle spooler)
 // -> quá hạn thì kill; tem đã ra hay chưa sẽ do vòng verify queue quyết định
 const SUMATRA_TIMEOUT_MS = Number(process.env.SUMATRA_TIMEOUT_MS || 30000);
 const PS_TIMEOUT_MS = Number(process.env.PS_TIMEOUT_MS || 10000);
+
+function verifyBudgetMs(pages) {
+  const n = Number.isFinite(pages) && pages > 0 ? pages : PRINT_VERIFY_UNKNOWN_PAGES;
+  return Math.min(PRINT_VERIFY_BASE_MS + PRINT_VERIFY_PER_PAGE_MS * n, PRINT_VERIFY_MAX_MS);
+}
 
 async function psRun(cmd, timeoutMs = PS_TIMEOUT_MS) {
   const { stdout } = await execFileAsync(
@@ -97,9 +112,10 @@ async function cancelJob(printer, id) {
 
 // Gửi lệnh in rồi XÁC MINH máy in thật sự nhả tem: driver SP46 không báo hết giấy
 // (DetectedErrorState luôn 0), nhưng khi hết giấy/tắt máy thì job kẹt lại trong queue.
-// Máy khỏe: queue rỗng sau 1-2s. Job kẹt quá PRINT_VERIFY_TIMEOUT_MS -> hủy job + báo lỗi
+// "Kẹt" = hết ngân sách theo số tem VÀ queue đứng yên -> hủy job còn lại + báo lỗi
 // (không hủy thì lúc lắp giấy lại job cũ tự nhả ra, gây in trùng với lần retry).
-async function printPdfFile(pdfPath, printer, step = () => {}) {
+// Lỗi ném ra mang theo .pagesPrinted để server biết lô đã in dở hay chưa in tem nào.
+async function printPdfFile(pdfPath, printer, step = () => {}, pages = null) {
   const before = new Set(await getQueueJobIds(printer));
   step("queue_snapshot", `queue co san ${before.size} job`);
 
@@ -121,41 +137,65 @@ async function printPdfFile(pdfPath, printer, step = () => {}) {
 
   // Verify bằng MỘT process PowerShell tự poll bên trong (250ms/nhịp):
   // spawn PowerShell mất ~0.5-1s nên spawn mỗi vòng poll như trước tốn 2-4s/đơn.
-  // Script in "CLEAN <polls>" khi queue sạch, "STUCK <polls> <ids>" khi quá hạn.
+  // Script in "CLEAN <polls> <pagesPrinted>" khi queue sạch,
+  //           "STUCK <polls> <pagesPrinted> <ids>" khi hết ngân sách mà queue đứng yên.
+  const budgetMs = verifyBudgetMs(pages);
   const esc = printer.replace(/'/g, "''");
   const beforeList = [...before].join(",");
   const verifyScript =
     `$before = @(${beforeList}); ` +
-    `$deadline = (Get-Date).AddMilliseconds(${PRINT_VERIFY_TIMEOUT_MS}); ` +
-    `$polls = 0; ` +
+    `$t0 = Get-Date; ` +
+    `$minDeadline = $t0.AddMilliseconds(${budgetMs}); ` +
+    `$maxDeadline = $t0.AddMilliseconds(${PRINT_VERIFY_MAX_MS}); ` +
+    `$stallDeadline = $t0.AddMilliseconds(${PRINT_STALL_TIMEOUT_MS}); ` +
+    `$polls = 0; $sig = ''; $printed = 0; ` +
     `while ($true) { ` +
-    `$ids = @(Get-PrintJob -PrinterName '${esc}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id); ` +
+    `$jobs = @(Get-PrintJob -PrinterName '${esc}' -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id }); ` +
     `$polls++; ` +
-    `$stuck = @($ids | Where-Object { $before -notcontains $_ }); ` +
-    `if ($stuck.Count -eq 0) { Write-Output ('CLEAN ' + $polls); exit 0 } ` +
-    `if ((Get-Date) -ge $deadline) { Write-Output ('STUCK ' + $polls + ' ' + ($stuck -join ',')); exit 0 } ` +
+    `if ($jobs.Count -eq 0) { Write-Output ('CLEAN ' + $polls + ' ' + $printed); exit 0 } ` +
+    `$printed = 0; foreach ($j in $jobs) { $printed += [int]$j.PagesPrinted } ` +
+    `$now = Get-Date; ` +
+    // Bất kỳ thay đổi nào (job rời queue hoặc thêm tem đã nhả) = còn sống -> gia hạn
+    `$cur = '' + $jobs.Count + ':' + $printed; ` +
+    `if ($cur -ne $sig) { $sig = $cur; $stallDeadline = $now.AddMilliseconds(${PRINT_STALL_TIMEOUT_MS}) } ` +
+    `if ($now -ge $maxDeadline -or ($now -ge $stallDeadline -and $now -ge $minDeadline)) { ` +
+    `Write-Output ('STUCK ' + $polls + ' ' + $printed + ' ' + ((@($jobs | ForEach-Object { $_.Id })) -join ',')); exit 0 } ` +
     `Start-Sleep -Milliseconds 250 }`;
 
   let out = "";
   try {
-    out = await psRun(verifyScript, PRINT_VERIFY_TIMEOUT_MS + PS_TIMEOUT_MS);
+    out = await psRun(verifyScript, PRINT_VERIFY_MAX_MS + PS_TIMEOUT_MS);
   } catch (err) {
     throw new Error(`Khong verify duoc queue may in "${printer}": ${err.message}`);
   }
 
   if (out.startsWith("CLEAN")) {
-    step("verify_queue", `queue sach sau ${out.split(" ")[1]} lan poll`);
+    const [, polls] = out.split(" ");
+    step("verify_queue", `queue sach sau ${polls} lan poll (ngan sach ${budgetMs}ms)`);
     return; // job của mình đã thoát queue -> đã in
   }
 
-  const [, polls, idList] = out.split(" ");
+  const [, polls, printedStr, idList] = out.split(" ");
+  const pagesPrinted = Number(printedStr) || 0;
   const stuck = (idList || "").split(",").map(Number).filter(Number.isFinite);
-  step("verify_queue", `KET ${stuck.length} job sau ${polls} lan poll -> huy`);
-  for (const id of stuck) await cancelJob(printer, id);
-  throw new Error(
-    `May in "${printer}" khong nha tem sau ${PRINT_VERIFY_TIMEOUT_MS / 1000}s ` +
-    `(het giay / tat may / loi?). Da huy lenh in ket trong queue de tranh in trung.`
+  step(
+    "verify_queue",
+    `KET ${stuck.length} job sau ${polls} lan poll, da nha ${pagesPrinted} tem -> huy`
   );
+  for (const id of stuck) await cancelJob(printer, id);
+
+  const total = Number.isFinite(pages) && pages > 0 ? pages : "?";
+  const err = new Error(
+    pagesPrinted > 0
+      ? `May in "${printer}" nha duoc ${pagesPrinted}/${total} tem roi DUNG ` +
+        `(het giay giua chung?). Da huy phan con lai. KHONG in lai tu dong ca lo - ` +
+        `kiem tra tem thuc te roi in bu bang force:true.`
+      : `May in "${printer}" khong nha tem nao sau ${Math.round(budgetMs / 1000)}s ` +
+        `(het giay / tat may / loi?). Da huy lenh in ket trong queue de tranh in trung.`
+  );
+  err.pagesPrinted = pagesPrinted;
+  err.printerStuck = true;
+  throw err;
 }
 
 // Thử tải URL xem có phải PDF trực tiếp không. Trả về đường dẫn file PDF hoặc null.
@@ -355,7 +395,7 @@ async function printLabel(url, opts = {}) {
   // 2/3) Render HTML (VTP hoặc generic)
   const r = await renderHtmlToPdf(u, opts, step);
   if (opts.skipPrint) return { type: "html", pages: r.pages, pdfPath: r.pdfPath };
-  await printPdfFile(r.pdfPath, printer, step);
+  await printPdfFile(r.pdfPath, printer, step, r.pages);
   fs.unlink(r.pdfPath, () => {});
   return { type: "html", pages: r.pages };
 }
